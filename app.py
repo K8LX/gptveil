@@ -57,22 +57,35 @@ LOGIN_PROMPT = (
 
 LOGIN_SUCCESS = "✅ Logged in. Choose an action:"
 
-ACCESS_DENIED = "🚫 Access denied."
+ACCESS_DENIED = "🚫 You're not authorised to use this bot."
 NOT_PRIVATE = "🔒 Please message me privately for security."
 SESSION_EXPIRED = "⚠️ Session expired — please log in again."
 
+SUPPORT_URL = "https://t.me/veilxsupportbot"
+
 # --- Keyboards ----------------------------------------------------------
+# `style` (PTB >= 22.7, Bot API with button styling) renders real colored
+# buttons on Telegram clients released after 2026-02-09; older clients just
+# show the button unstyled, so this degrades safely.
 
 
 def start_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]])
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔐 Login", callback_data="login", style="primary")]]
+    )
 
 
 def action_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🙈 Hide", callback_data="hide"),
-          InlineKeyboardButton("👁 Unhide", callback_data="unhide")],
-         [InlineKeyboardButton("🚪 Logout", callback_data="logout")]]
+        [[InlineKeyboardButton("🙈 Hide", callback_data="hide", style="success"),
+          InlineKeyboardButton("👁 Unhide", callback_data="unhide", style="primary")],
+         [InlineKeyboardButton("🚪 Logout", callback_data="logout", style="danger")]]
+    )
+
+
+def access_denied_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🆘 Contact Support", url=SUPPORT_URL)]]
     )
 
 
@@ -217,7 +230,7 @@ def set_list_visibility(sessionid: str, hide: bool) -> dict:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
-        await update.message.reply_text(ACCESS_DENIED)
+        await update.message.reply_text(ACCESS_DENIED, reply_markup=access_denied_keyboard())
         return
     context.user_data["awaiting_login"] = False
     await update.message.reply_text(
@@ -227,7 +240,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
-        await update.message.reply_text(ACCESS_DENIED)
+        await update.message.reply_text(ACCESS_DENIED, reply_markup=access_denied_keyboard())
         return
     with session_lock:
         pending_sessions.pop(update.effective_user.id, None)
@@ -238,7 +251,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def receive_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
-        await update.message.reply_text(ACCESS_DENIED)
+        await update.message.reply_text(ACCESS_DENIED, reply_markup=access_denied_keyboard())
         return
     if not context.user_data.get("awaiting_login"):
         await update.message.reply_text("👋 Tap 🔐 Login to get started.")
@@ -265,7 +278,7 @@ async def choose_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
     user = query.from_user
     if user.id not in ALLOWED_USER_IDS:
-        await query.edit_message_text(ACCESS_DENIED)
+        await query.edit_message_text(ACCESS_DENIED, reply_markup=access_denied_keyboard())
         return
 
     if query.data == "login":
