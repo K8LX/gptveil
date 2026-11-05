@@ -36,9 +36,44 @@ ALLOWED_USER_IDS = {
 }
 PORT = int(os.getenv("PORT", "10000"))
 
-# Session IDs are kept in process memory only, per Telegram user, until action/cancel.
+# Session IDs are kept in process memory only, per Telegram user, until action/logout.
 pending_sessions: dict[int, str] = {}
 session_lock = threading.Lock()
+
+# --- Text -------------------------------------------------------------------
+
+START_TEXT = (
+    "🕶️ *VEIL-X*\n"
+    "Control your Instagram list visibility.\n\n"
+    "Tap below to log in."
+)
+
+LOGIN_PROMPT = (
+    "🔑 Send your Instagram `sessionid` cookie value — just the value, "
+    "without the `sessionid=` prefix.\n\n"
+    "🔒 Kept in memory only, never saved to disk. Delete your message after sending.\n\n"
+    "Use /cancel to go back."
+)
+
+LOGIN_SUCCESS = "✅ Logged in. Choose an action:"
+
+ACCESS_DENIED = "🚫 Access denied."
+NOT_PRIVATE = "🔒 Please message me privately for security."
+SESSION_EXPIRED = "⚠️ Session expired — please log in again."
+
+# --- Keyboards ----------------------------------------------------------
+
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login")]])
+
+
+def action_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🙈 Hide", callback_data="hide"),
+          InlineKeyboardButton("👁 Unhide", callback_data="unhide")],
+         [InlineKeyboardButton("🚪 Logout", callback_data="logout")]]
+    )
 
 
 def is_allowed(update: Update) -> bool:
@@ -46,16 +81,28 @@ def is_allowed(update: Update) -> bool:
     return bool(user and user.id in ALLOWED_USER_IDS)
 
 
+async def send_start_screen(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=START_TEXT,
+        reply_markup=start_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+# --- Instagram call -----------------------------------------------------
+
+
 def make_authorization(sessionid: str) -> tuple[str, str]:
     if not sessionid or any(
         ord(c) <= 32 or ord(c) >= 127 or c in ';,"\\' for c in sessionid
     ):
-        raise ValueError("Invalid input. Send only the sessionid cookie value.")
+        raise ValueError("⚠️ Invalid input — send only the sessionid cookie value.")
     match = re.fullmatch(r"([1-9][0-9]*)(?::|%3[aA]).+", sessionid)
     if not match:
         raise ValueError(
-            "Invalid sessionid format. It should start with your numeric Instagram user ID "
-            "followed by ':' (or '%3A'). Do not include 'sessionid='."
+            "⚠️ Invalid format. It should start with your numeric Instagram user ID "
+            "followed by ':' (or '%3A'). Don't include 'sessionid='."
         )
     user_id = match.group(1)
     token = base64.b64encode(
@@ -165,44 +212,40 @@ def set_list_visibility(sessionid: str, hide: bool) -> dict:
     return body
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔒 Hide lists", callback_data="hide"),
-          InlineKeyboardButton("👁 Unhide lists", callback_data="unhide")],
-         [InlineKeyboardButton("✖ Cancel", callback_data="cancel")]]
-    )
+# --- Handlers -------------------------------------------------------------
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
-        await update.message.reply_text("Access denied.")
+        await update.message.reply_text(ACCESS_DENIED)
         return
+    context.user_data["awaiting_login"] = False
     await update.message.reply_text(
-        "VEIL-X — Instagram list visibility\n\n"
-        "Send your Instagram sessionid cookie value in this private chat "
-        "(without the 'sessionid=' prefix). I’ll then show Hide and Unhide buttons.\n\n"
-        "Security: only your own account; never share this cookie with anyone. "
-        "This bot keeps it in RAM temporarily and does not save it to disk. "
-        "Delete the message containing the cookie from this chat after sending it.\n\n"
-        "Use /cancel to clear the pending session."
+        START_TEXT, reply_markup=start_keyboard(), parse_mode="Markdown"
     )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
-        await update.message.reply_text("Access denied.")
+        await update.message.reply_text(ACCESS_DENIED)
         return
     with session_lock:
         pending_sessions.pop(update.effective_user.id, None)
-    await update.message.reply_text("Pending session cleared.")
+    context.user_data["awaiting_login"] = False
+    await update.message.reply_text("✖️ Cancelled. Session cleared.")
+    await send_start_screen(update.effective_chat.id, context)
 
 
 async def receive_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
-        await update.message.reply_text("Access denied.")
+        await update.message.reply_text(ACCESS_DENIED)
+        return
+    if not context.user_data.get("awaiting_login"):
+        await update.message.reply_text("👋 Tap 🔐 Login to get started.")
+        await send_start_screen(update.effective_chat.id, context)
         return
     if update.effective_chat.type != "private":
-        await update.message.reply_text("For safety, use this bot in a private chat.")
+        await update.message.reply_text(NOT_PRIVATE)
         return
     value = (update.message.text or "").strip()
     try:
@@ -213,10 +256,8 @@ async def receive_session(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     with session_lock:
         pending_sessions[update.effective_user.id] = value
-    await update.message.reply_text(
-        "Session received temporarily. Choose an action:",
-        reply_markup=main_keyboard(),
-    )
+    context.user_data["awaiting_login"] = False
+    await update.message.reply_text(LOGIN_SUCCESS, reply_markup=action_keyboard())
 
 
 async def choose_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -224,13 +265,20 @@ async def choose_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
     user = query.from_user
     if user.id not in ALLOWED_USER_IDS:
-        await query.edit_message_text("Access denied.")
+        await query.edit_message_text(ACCESS_DENIED)
         return
 
-    if query.data == "cancel":
+    if query.data == "login":
+        context.user_data["awaiting_login"] = True
+        await query.edit_message_text(LOGIN_PROMPT, parse_mode="Markdown")
+        return
+
+    if query.data == "logout":
         with session_lock:
             pending_sessions.pop(user.id, None)
-        await query.edit_message_text("Pending session cleared.")
+        context.user_data["awaiting_login"] = False
+        await query.edit_message_text("🚪 Logged out. Session cleared.")
+        await send_start_screen(query.message.chat_id, context)
         return
 
     if query.data not in ("hide", "unhide"):
@@ -238,31 +286,31 @@ async def choose_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     with session_lock:
         sessionid = pending_sessions.pop(user.id, None)
     if not sessionid:
-        await query.edit_message_text("No pending session. Send /start and submit it again.")
+        await query.edit_message_text(SESSION_EXPIRED)
+        await send_start_screen(query.message.chat_id, context)
         return
 
     hide = query.data == "hide"
-    await query.edit_message_text(
-        "Applying the change… This may take a few seconds. No automatic retry."
-    )
+    await query.edit_message_text("⏳ Applying the change…")
     try:
         # Run blocking network I/O off the async event loop.
         import asyncio
         await asyncio.to_thread(set_list_visibility, sessionid, hide)
-        result = "🔒 Instagram confirmed: followers/following lists are now hidden."
-        if not hide:
-            result = "👁 Instagram confirmed: followers/following lists are now unhidden."
-        await query.message.reply_text(
-            result + "\n\nThe session was cleared from bot memory."
+        result = (
+            "🙈 Done — your followers/following lists are now hidden."
+            if hide
+            else "👁 Done — your followers/following lists are now visible."
         )
+        await query.message.reply_text(result)
     except (RuntimeError, ValueError, urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
         # Error messages are deliberately sanitized; never echo credentials.
         await query.message.reply_text(
-            f"Could not confirm the change: {str(error)[:400]}\n"
-            "The session was cleared from bot memory. Check Instagram manually before retrying."
+            f"⚠️ Couldn't confirm the change: {str(error)[:400]}\n"
+            "Please verify on Instagram before retrying."
         )
     finally:
         sessionid = None
+    await send_start_screen(query.message.chat_id, context)
 
 
 class HealthHandler(BaseHTTPRequestHandler):
